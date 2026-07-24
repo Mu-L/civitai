@@ -352,6 +352,7 @@ type CollectionForPermission = {
   write: CollectionWriteConfiguration;
   imageId?: number;
   type?: CollectionType;
+  mode?: CollectionMode | null;
 };
 
 export const getUserCollectionsWithPermissions = async <
@@ -361,17 +362,32 @@ export const getUserCollectionsWithPermissions = async <
 }: {
   input: GetAllUserCollectionsInputSchema & { userId: number };
 }) => {
-  const { userId, permission, contributingOnly = true } = input;
+  const {
+    userId,
+    permission,
+    contributingOnly = true,
+    includeActiveContests = false,
+    contestModelId,
+  } = input;
   let { permissions = [] } = input;
   // By default, owned collections will be always returned
   const AND: Prisma.Sql[] = [];
   const SELECT: Prisma.Sql = Prisma.raw(
-    `SELECT c."id", c."name", c."description", c."read", c."userId", c."write", c."imageId", c."type"`
+    `SELECT c."id", c."name", c."description", c."read", c."userId", c."write", c."imageId", c."type", c."mode"`
   );
 
   if (input.type) {
     AND.push(Prisma.sql`(c."type" = ${input.type}::"CollectionType" OR c."type" IS NULL)`);
   }
+
+  // When surfacing active contests, Contest-mode collections must come ONLY through the
+  // ownership+window-gated branch below — never via the contributor/public-read branches, which
+  // carry no ownership or submission-window check and would leak followed or closed contests into
+  // the picker for models the user doesn't own. Off for non-model callers, leaving the normal
+  // follow flow untouched. Owned contests still surface via the owned-collections branch (query 1).
+  const excludeContests = includeActiveContests
+    ? Prisma.sql`AND c."mode" IS DISTINCT FROM ${CollectionMode.Contest}::"CollectionMode"`
+    : Prisma.empty;
 
   const queries: Prisma.Sql[] = [
     Prisma.sql`(
@@ -409,6 +425,7 @@ export const getUserCollectionsWithPermissions = async <
       FROM "Collection" c
       WHERE "read" = ${CollectionReadConfiguration.Public}::"CollectionReadConfiguration"
         ${AND.length > 0 ? Prisma.sql`AND ${Prisma.join(AND, ',')}` : Prisma.sql``}
+        ${excludeContests}
 
     `);
   }
@@ -426,6 +443,37 @@ export const getUserCollectionsWithPermissions = async <
           )}]::"CollectionContributorPermission"[]
           AND cc."collectionId" IS NOT NULL
           ${AND.length > 0 ? Prisma.sql`AND ${Prisma.join(AND, ',')}` : Prisma.sql``}
+          ${excludeContests}
+    )`);
+  }
+
+  // Active-window contest collections the user can submit to for review WITHOUT following first.
+  // Contest + Review-write + Public-read, with a real submission window that is open RIGHT NOW.
+  // A defined, in-future submissionEndDate is REQUIRED: without it we'd surface every windowless
+  // contest ever created (old contests / daily challenges store no submission dates). Start date,
+  // if present, must have passed. Kept independent of contributor joins so it also surfaces
+  // contests the user hasn't joined; UNION de-dupes any that already appear via the branches above.
+  // Gated on the user owning the target model: you can only submit your own models to a contest,
+  // so a non-owned model (or an absent contestModelId) fails closed and surfaces nothing.
+  if (includeActiveContests && contestModelId) {
+    queries.push(Prisma.sql`(
+        ${SELECT}
+        FROM "Collection" c
+        WHERE c."mode" = ${CollectionMode.Contest}::"CollectionMode"
+          AND c."write" = ${CollectionWriteConfiguration.Review}::"CollectionWriteConfiguration"
+          AND c."read" = ${CollectionReadConfiguration.Public}::"CollectionReadConfiguration"
+          AND c."metadata"->>'submissionEndDate' IS NOT NULL
+          AND (c."metadata"->>'submissionEndDate')::timestamptz >= now()
+          AND (
+            c."metadata"->>'submissionStartDate' IS NULL
+            OR (c."metadata"->>'submissionStartDate')::timestamptz <= now()
+          )
+          AND EXISTS (
+            SELECT 1 FROM "Model" m
+            WHERE m."id" = ${contestModelId} AND m."userId" = ${userId}
+          )
+          ${AND.length > 0 ? Prisma.sql`AND ${Prisma.join(AND, ',')}` : Prisma.sql``}
+        LIMIT 100
     )`);
   }
 
@@ -643,8 +691,15 @@ export const saveItemInCollections = async ({
           });
         }
 
-        if (!permission.isContributor && !permission.isOwner) {
-          // Person adding content to stuff they don't follow.
+        // Non-owners who don't contribute may still submit to Public-write (write) or Review-write
+        // (writeReview) collections — the follow above is skipped when disableFollowOnSubmission is
+        // set, so gate on the standing write grant rather than contributor status.
+        if (
+          !permission.isContributor &&
+          !permission.isOwner &&
+          !permission.writeReview &&
+          !permission.write
+        ) {
           return null;
         }
 
@@ -2111,6 +2166,19 @@ export const validateContestCollectionEntry = async ({
     throw throwBadRequestError('Collection is not accepting submissions at this time');
   }
 
+  // You can only submit your own models to a contest. Enforced independently of the
+  // submissionStartDate window below so it holds for windowless contests too.
+  if (modelIds.length > 0 && !isModerator) {
+    const submittedModels = await dbRead.model.findMany({
+      where: { id: { in: modelIds } },
+      select: { id: true, userId: true },
+    });
+
+    if (submittedModels.some((model) => model.userId !== userId)) {
+      throw throwBadRequestError('You can only submit your own models to a contest.');
+    }
+  }
+
   if (metadata.submissionStartDate) {
     // confirm items were created after the start date
     if (articleIds.length > 0) {
@@ -2558,8 +2626,7 @@ export const bulkSaveItems = async ({
           logToAxiom({
             type: 'error',
             name: 'contest-entry-fee-rollback-failed',
-            message:
-              rollbackError instanceof Error ? rollbackError.message : String(rollbackError),
+            message: rollbackError instanceof Error ? rollbackError.message : String(rollbackError),
             stack: rollbackError instanceof Error ? rollbackError.stack : undefined,
             originalError: originalError instanceof Error ? originalError.message : undefined,
             collectionId,
