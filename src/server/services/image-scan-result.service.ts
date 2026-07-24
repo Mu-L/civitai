@@ -44,6 +44,9 @@ import {
   tagCacheByName,
   userImageVideoCountCaches,
 } from '~/server/redis/caches';
+import type { RedisKeyTemplateSys } from '~/server/redis/client';
+import { REDIS_SYS_KEYS, sysRedis } from '~/server/redis/client';
+import { classifyImageScanFailure } from '~/server/services/image-scan-failure';
 import type { MediaMetadata } from '~/server/schema/media.schema';
 import { deleteUserProfilePictureCache } from '~/server/services/user.service';
 import { bustCachesForPosts, updatePostNsfwLevel } from '~/server/services/post.service';
@@ -120,8 +123,59 @@ type ProcessedTag = {
   type: TagType;
 };
 
+// TTL for a stashed job reason. Comfortably longer than the orchestrator's 10-min
+// workflow expiry so the terminal workflow event can still read it.
+const JOB_REASON_TTL_SECONDS = 15 * 60;
+
+const jobReasonKey = (workflowId: string) =>
+  `${REDIS_SYS_KEYS.WEBHOOKS.IMAGE_SCAN_JOB_REASON}:${workflowId}` as RedisKeyTemplateSys;
+
+/** Orchestrator job-level event shape we care about (a subset of WorkflowStepJobEvent). */
+type OrchestratorJobEvent = {
+  $type?: string;
+  workflowId?: string;
+  jobId?: string;
+  reason?: string | null;
+};
+
+// Stash the job's failure `reason` keyed by workflowId. No DB/orchestrator round-trip:
+// just a short-lived Redis write so the terminal workflow event can classify.
+//
+// Correlation contract: job events fire before the terminal workflow event, so the
+// reason is stashed by the time the workflow event reads it. Across a workflow's
+// several jobs this is last-write-wins (fine — image scans typically have one failing
+// job; the reason strings we classify on are equivalent). If the reason is missing
+// (race, or a job event that never arrived) the failure classifies as Unknown, which
+// retries conservatively under the bounded cap — safe by construction. The TTL bounds
+// a stash that never gets a following workflow event so it can't linger.
+async function captureJobFailureReason(event: OrchestratorJobEvent) {
+  const workflowId = event.workflowId;
+  const reason = typeof event.reason === 'string' ? event.reason.trim() : '';
+  if (!workflowId || !reason) return;
+  await sysRedis
+    .set(jobReasonKey(workflowId), reason, { EX: JOB_REASON_TTL_SECONDS })
+    .catch(() => null);
+}
+
+async function readJobFailureReason(workflowId: string): Promise<string | null> {
+  const reason = await sysRedis.get(jobReasonKey(workflowId)).catch(() => null);
+  if (reason) sysRedis.del(jobReasonKey(workflowId)).catch(() => null);
+  return reason ?? null;
+}
+
 export async function processImageScanResult(req: NextApiRequest) {
   const event: WorkflowEvent = req.body;
+
+  // A job-level failure event only carries the reason — capture it and return; the
+  // workflow-level terminal event (below) does the actual ingestion update. Job
+  // events carry a top-level `jobId` (workflow events never do), and we only
+  // subscribe to job:failed/expired/canceled, so any job event here is a failure.
+  // Cast rather than a type predicate so `event` stays a WorkflowEvent afterwards.
+  const jobEvent = event as OrchestratorJobEvent;
+  if (typeof jobEvent.jobId === 'string') {
+    await captureJobFailureReason(jobEvent);
+    return;
+  }
 
   const { data } = await getWorkflow({
     client: internalOrchestratorClient,
@@ -177,24 +231,24 @@ export async function processImageScanWorkflow({
   completedAt?: Date | string | null;
 }) {
   if (status !== 'succeeded') {
-    // Record WHICH orchestrator steps failed (wdTagging / mediaHash /
-    // mediaRating) — this is the key diagnostic. The orchestrator emits only a
-    // workflow-level status (`failed`/`canceled`; it never sends `expired`) with
-    // no per-job error reason on the wire, so the failing-step name is the only
-    // signal we have to tell transient decode/fetch churn apart from a genuine
-    // rating failure. NOTE: `markImageScanError` still ALWAYS bumps retryCount
-    // toward the 9-cap (see there). The expired-vs-failed "don't burn a retry"
-    // behavior is deferred: with no `expired` status and no per-job reason we
-    // can't yet distinguish a transient timeout from a real failure — this
-    // step/reason logging is the data needed to design that fix.
+    // Which orchestrator steps failed (wdTagging / mediaHash / mediaRating) plus
+    // the job-level `reason` — captured off the `job:failed`/`job:expired`
+    // callback (getWorkflow itself exposes no per-job error) — are how we tell
+    // transient infra churn (Siglip container instability, 5xx, timeouts,
+    // expiry) apart from a genuinely unscannable image. `markImageScanError`
+    // stamps a `failureClass` from those signals; the `ingest-images` cron uses
+    // it to pick a retry ceiling. retryCount ALWAYS bumps (the absolute backstop).
     const failedSteps = extractFailedSteps(steps);
-    const failureType = status === 'canceled' ? 'canceled' : 'workflow-failed';
-    const { retryCount, mediaType } = await markImageScanError({
+    const failureType =
+      status === 'expired' ? 'expired' : status === 'canceled' ? 'canceled' : 'workflow-failed';
+    const reason = await readJobFailureReason(workflowId);
+    const { retryCount, mediaType, failureClass } = await markImageScanError({
       workflowId,
       imageId,
       status,
       failureType,
       failedSteps,
+      reason,
     });
     logToAxiom(
       {
@@ -204,6 +258,8 @@ export async function processImageScanWorkflow({
         source: 'image-scan-result.service',
         failureType,
         failedSteps,
+        reason,
+        failureClass,
         imageId,
         mediaType,
         workflowId,
@@ -450,11 +506,14 @@ function extractFailedSteps(steps: ScanResultStep[]): string[] {
 
 /**
  * Flip an image to `Error`, increment its scan `retryCount`, and stamp a small
- * `scanJobs.error = { status, failureType, failedSteps, at }` so a plain
- * Postgres query can tell WHY a scan errored (and which step) without an
- * orchestrator lookup. Returns the new (post-increment) retryCount and the
- * image's mediaType so callers can log them; both are `null` when no row matched
- * (e.g. the image was deleted between scan request and callback).
+ * `scanJobs.error = { status, failureType, failedSteps, reason, failureClass, at }`
+ * so a plain Postgres query can tell WHY a scan errored (and which step) without an
+ * orchestrator lookup — and so the `ingest-images` cron can pick a retry ceiling
+ * from `failureClass`. retryCount ALWAYS increments: it's the absolute attempt
+ * count the per-class ceilings are applied against. Returns the new (post-increment)
+ * retryCount, the image's mediaType, and the computed failureClass; retryCount /
+ * mediaType are `null` when no row matched (e.g. the image was deleted between scan
+ * request and callback).
  */
 async function markImageScanError({
   workflowId,
@@ -462,17 +521,33 @@ async function markImageScanError({
   status,
   failureType,
   failedSteps,
+  reason,
+  middleware,
 }: {
   workflowId: string;
   imageId: number;
   status: string;
   failureType: string;
   failedSteps: string[];
-}): Promise<{ retryCount: number | null; mediaType: string | null }> {
+  /** Human failure reason from the job-level callback, if captured. */
+  reason?: string | null;
+  /** Orchestrator middleware locus, if known. Not exposed on the v2 job event today. */
+  middleware?: string | null;
+}): Promise<{
+  retryCount: number | null;
+  mediaType: string | null;
+  failureClass: string;
+}> {
+  const failureClass = classifyImageScanFailure({ reason, failureType, middleware, failedSteps });
+  // undefined keys are dropped by JSON.stringify, so absent reason/middleware
+  // simply don't appear in the stored blob.
   const errorJson = JSON.stringify({
     status,
     failureType,
     failedSteps,
+    reason: reason ?? undefined,
+    middleware: middleware ?? undefined,
+    failureClass,
     at: new Date().toISOString(),
   });
   const rows = await dbWrite.$queryRaw<{ retryCount: number | null; mediaType: string | null }[]>`
@@ -495,7 +570,11 @@ async function markImageScanError({
     WHERE id = ${imageId}
     RETURNING ("scanJobs"->>'retryCount')::int as "retryCount", type as "mediaType"
   `;
-  return { retryCount: rows[0]?.retryCount ?? null, mediaType: rows[0]?.mediaType ?? null };
+  return {
+    retryCount: rows[0]?.retryCount ?? null,
+    mediaType: rows[0]?.mediaType ?? null,
+    failureClass,
+  };
 }
 
 // Image loading
