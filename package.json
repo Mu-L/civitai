@@ -278,6 +278,7 @@
     "react-konva": "^18.2.14",
     "react-markdown": "^9.0.1",
     "react-social-media-embed": "^2.5.9",
+    "recheck": "^4.5.0",
     "redis": "^5.8.3",
     "rehype-raw": "^7.0.0",
     "rehype-stringify": "^10.0.1",
